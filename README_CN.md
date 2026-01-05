@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-本项目包含SAMM（Spontaneous Affective Facial Expressions in the Wild）微表情识别系统的完整算法伪代码。该系统使用面部关键点检测和深度学习技术来识别和分类微表情。
+本项目是论文《Dual-Branch Network with Dynamic Time Warping》的算法说明伪代码。论文主体部分使用CASMEⅡ数据集进行实验，本伪代码使用SAMM数据集用作演示。该系统使用面部关键点检测和深度学习技术来识别和分类微表情。
 
 ## 目录结构
 
