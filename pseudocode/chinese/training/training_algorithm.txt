@@ -1,0 +1,262 @@
+算法：SAMM微表情识别模型训练算法
+
+// 全局配置参数
+CONFIG = {
+    data_dir: "E:\\LW\\SAMM_videos",         // 数据集路径
+    use_refined_landmarks: 真,            // 是否使用细节优化关键点（假=468，真=478）
+    target_length: 20,                      // 统一序列长度
+    batch_size: 2,                         // 训练批大小
+    epochs: 100,                           // 最大训练轮次
+    model_path: "me_model_tf.h5",          // 模型保存路径
+    min_frames: 10,                        // 实时检测最小帧数
+    is_training: 真,                     // 是否为训练模式
+    AugTimes: 5                            // 数据增强次数 训练模式生效
+}
+
+// 计算输入维度
+LANDMARK_POINTS = 478 若 CONFIG["use_refined_landmarks"] 为真 否则 468
+CONFIG["input_shape"] = (CONFIG["target_length"], LANDMARK_POINTS * 3)
+
+// 特征提取器类
+类 特征提取器:
+    初始化():
+        face_mesh = mp.解决方案.面部网格.面部网格(
+            static_image_mode=假,
+            max_num_faces=1,
+            refine_landmarks=CONFIG["use_refined_landmarks"],
+            min_detection_confidence=0.5)
+
+    处理视频(视频路径):
+        cap = cv2.视频捕获(视频路径)
+        landmarks_seq = []
+        
+        当 cap.isOpened() 为真 时:
+            ret, frame = cap.读取()
+            若 不是 ret:
+                跳出循环
+            
+            results = face_mesh.处理(cv2.转换颜色空间(frame, cv2.COLOR_BGR2RGB))
+            若 results.multi_face_landmarks 存在:
+                landmarks = 数组([[lm.x, lm.y, lm.z]
+                                    对于 lm 在 results.multi_face_landmarks[0].地标]):
+                landmarks_seq.添加(landmarks.展平())
+        
+        cap.释放()
+        返回 数组(landmarks_seq)
+
+// 序列处理器类
+类 序列处理器:
+    初始化():
+        target_length = CONFIG["target_length"]
+        selected_indices = [x 对于 x 在 范围(LANDMARK_POINTS)]
+
+    对齐序列(序列):
+        若 序列.长度() < 2:
+            返回 零数组((target_length, 序列.形状[1]))
+        
+        // 提取关键点特征用于DTW对齐
+        selected_features = 序列[:, selected_indices].重塑(长度(序列), -1)
+        
+        // 生成参考序列（使用线性插值）
+        original_length = 长度(序列)
+        x_orig = 线性空间(0, 1, original_length)
+        x_new = 线性空间(0, 1, target_length)
+        R_selected = 零数组((target_length, selected_features.形状[1]))
+        
+        对于 dim 在 范围(selected_features.形状[1]):
+            f = 插值函数(x_orig, selected_features[:, dim], 类型='线性', 填充值="外推")
+            R_selected[:, dim] = f(x_new)
+        
+        // 计算DTW路径
+        _, path = 快速动态时间规整(selected_features, R_selected, 距离=欧几里得距离)
+        
+        // 根据路径构建对齐后的序列
+        aligned = 零数组((target_length, 序列.形状[1]))
+        counts = 零数组(target_length)
+        
+        对于 s_idx, r_idx 在 path:
+            aligned[r_idx] += 序列[s_idx]
+            counts[r_idx] += 1
+        
+        // 处理未对齐的位置并归一化
+        counts[counts == 0] = 1  // 避免除以零
+        aligned /= counts[:, 新轴]
+        
+        返回 aligned
+    
+    标准化(序列):
+        mean = 平均值(序列, 轴=0)
+        std = 标准差(序列, 轴=0)
+        返回 (序列 - mean) / (std + 1e-8)
+    
+    处理(序列):
+        processed = 对齐序列(序列)
+        返回 标准化(processed)
+
+// 指标回调类
+类 指标回调(回调基类):
+    初始化(X_val, y_val):
+        超类().__初始化__()
+        本.X_val = X_val
+        本.y_val = y_val
+    
+    在轮次结束时(轮次, 日志=空):
+        // 预测验证集
+        y_pred = 本.模型.预测(本.X_val, 详细=0)
+        y_pred_classes = 最大值索引(y_pred, 轴=1)
+        
+        // 计算指标
+        val_recall = 召回率分数(本.y_val, y_pred_classes, 平均='宏')
+        val_f1 = f1分数(本.y_val, y_pred_classes, 平均='宏')
+        
+        // 记录到训练日志
+        日志['val_recall'] = val_recall
+        日志['val_f1'] = val_f1
+        
+        // 输出指标结果
+        打印(f" - val_recall: {val_recall:.4f} - val_f1: {val_f1:.4f}")
+
+// 构建模型函数
+构建模型():
+    inputs = tf.keras.输入(形状=CONFIG["input_shape"])
+    
+    // 时空特征并行提取
+    // 分支1：CNN处理局部特征
+    cnn = tf.keras.层.一维卷积(64, 5, 填充='相同')(inputs)
+    cnn = tf.keras.层.批标准化()(cnn)
+    cnn = tf.keras.层.ReLU()(cnn)
+    cnn = tf.keras.层.丢弃(0.3)(cnn)
+    
+    // 分支2：BiLSTM处理时序特征
+    lstm = tf.keras.层.双向(
+        tf.keras.层.LSTM(32, 返回序列=真))(inputs)
+    lstm = tf.keras.层.一维卷积(64, 3, 填充='相同')(lstm)  // 统一通道数
+    
+    // 特征融合（沿特征轴拼接）
+    merged = tf.keras.层.连接([cnn, lstm], 轴=-1)
+    
+    // 时空特征联合处理
+    x = tf.keras.层.一维卷积(128, 3, 填充='相同')(merged)
+    x = tf.keras.层.全局平均池化1D()(x)
+    
+    // 分类层
+    x = tf.keras.层.全连接(64, 激活='relu',
+                            核正则化='l2')(x)
+    x = tf.keras.层.丢弃(0.5)(x)
+    outputs = tf.keras.层.全连接(长度(类), 激活='softmax')(x)
+    
+    model = tf.keras.模型(输入=inputs, 输出=outputs)
+    
+    // 优化器配置
+    optimizer = tf.keras.优化器.Adam(学习率=1e-4)
+    model.编译(优化器=optimizer,
+                损失='稀疏分类交叉熵',
+                指标=['准确率'])
+    返回 model
+
+// 数据增强器类
+类 数据增强器:
+    初始化():
+        noise_factor = 0.03
+    
+    增强(序列):
+        // 时序增强
+        若 随机.随机() > 0.5:
+            序列 = 时间扭曲(序列)
+        
+        // 空间增强
+        序列 += 随机.正态(0, noise_factor, 序列.形状)
+        返回 序列
+    
+    时间扭曲(序列):
+        x = 线性空间(0, 1, 长度(序列))
+        new_x = 线性空间(0, 1, 长度(序列)) + 随机.正态(0, 0.1, 长度(序列))
+        new_x = 限制(new_x, 0, 1)
+        返回 插值函数(x, 序列, 轴=0)(new_x)
+
+// 加载数据集函数
+加载数据集():
+    全局 类  // 声明为全局变量以便其他函数使用
+    
+    categories = 排序([d 对于 d 在 列表目录(CONFIG["data_dir"])
+                        若 os.路径.是目录(连接路径(CONFIG["data_dir"], d))])
+    打印(categories)
+    label_encoder = 标签编码器().拟合(categories)
+    类 = label_encoder.类_
+    
+    打印(类)
+    
+    extractor = 特征提取器()
+    processor = 序列处理器()
+    
+    X, y = [], []
+    对于 label_name 在 categories:
+        打印(label_name)
+        label_idx = label_encoder.转换([label_name])[0]
+        video_dir = 连接路径(CONFIG["data_dir"], label_name)
+        
+        video_files = [f 对于 f 在 列表目录(video_dir)
+                      若 f.小写().结束于('.mp4')]
+        
+        对于 video_file 在 进度条(video_files, 描述=f'处理 {label_name}'):
+            video_path = 连接路径(video_dir, video_file)
+            raw_seq = extractor.处理视频(video_path)
+            
+            // 数据过滤和处理
+            若 长度(raw_seq) < 5:  // 过滤过短序列
+                继续
+            
+            尝试:
+                processed = processor.处理(raw_seq)
+                若 CONFIG["is_training"]:  // 仅在训练时增强
+                    对于 _ 在 范围(CONFIG["AugTimes"]):
+                        processed = 数据增强器().增强(processed)
+                        X.添加(processed)
+                        y.添加(label_idx)
+                否则:
+                    X.添加(processed)
+                    y.添加(label_idx)
+            除了 异常 as e:
+                打印(f"处理错误 {video_path}: {str(e)}")
+                继续
+    
+    X = 数组(X).转换为(浮点32)
+    y = 数组(y)
+    返回 X, y
+
+// 训练主流程
+训练():
+    // 加载数据
+    X, y = 加载数据集()
+    打印(f"数据集加载: {X.形状} 序列, {长度(类)} 类别")
+    
+    // 划分数据集
+    X_train, X_val, y_train, y_val = 训练测试分割(
+        X, y, 测试大小=0.2, 分层=y, 随机状态=42)
+    
+    // 构建模型
+    model = 构建模型()
+    model.摘要()  // 打印模型结构
+    
+    // 训练配置
+    callbacks = [
+        指标回调(X_val, y_val),
+        tf.keras.回调.早停(patience=5, 恢复最佳权重=真),
+        tf.keras.回调.学习率降低(因子=0.5, patience=3)
+    ]
+    
+    // 开始训练
+    history = model.拟合(
+        X_train, y_train,
+        验证数据=(X_val, y_val),
+        轮次=CONFIG["epochs"],
+        批大小=CONFIG["batch_size"],
+        回调=callbacks
+    )
+    
+    打印("训练完成")
+    
+    // 保存模型
+    model.保存(CONFIG["model_path"], 保存格式='tf')
+    打印(f"模型保存到 {CONFIG['model_path']}")
+    返回 model
