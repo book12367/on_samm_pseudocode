@@ -1,0 +1,262 @@
+Algorithm: SAMM Micro-expression Recognition Model Training Algorithm
+
+// Global configuration parameters
+CONFIG = {
+    data_dir: "E:\\LW\\SAMM_videos",         // Dataset path
+    use_refined_landmarks: true,            // Whether to use refined landmarks (false=468, true=478)
+    target_length: 20,                      // Unified sequence length
+    batch_size: 2,                         // Training batch size
+    epochs: 100,                           // Maximum training epochs
+    model_path: "me_model_tf.h5",          // Model save path
+    min_frames: 10,                        // Minimum frames for real-time detection
+    is_training: true,                     // Whether in training mode
+    AugTimes: 5                            // Data augmentation times, effective in training mode
+}
+
+// Calculate input dimensions
+LANDMARK_POINTS = 478 if CONFIG["use_refined_landmarks"] is true else 468
+CONFIG["input_shape"] = (CONFIG["target_length"], LANDMARK_POINTS * 3)
+
+// Feature Extractor Class
+class FeatureExtractor:
+    initialize():
+        face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=false,
+            max_num_faces=1,
+            refine_landmarks=CONFIG["use_refined_landmarks"],
+            min_detection_confidence=0.5)
+
+    process_video(video_path):
+        cap = cv2.VideoCapture(video_path)
+        landmarks_seq = []
+        
+        while cap.isOpened() is true:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            results = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            if results.multi_face_landmarks exists:
+                landmarks = array([[lm.x, lm.y, lm.z]
+                                    for lm in results.multi_face_landmarks[0].landmark])
+                landmarks_seq.append(landmarks.flatten())
+        
+        cap.release()
+        return array(landmarks_seq)
+
+// Sequence Processor Class
+class SequenceProcessor:
+    initialize():
+        target_length = CONFIG["target_length"]
+        selected_indices = [x for x in range(LANDMARK_POINTS)]
+
+    align_sequence(sequence):
+        if sequence.length() < 2:
+            return zeros((target_length, sequence.shape[1]))
+        
+        // Extract keypoint features for DTW alignment
+        selected_features = sequence[:, selected_indices].reshape(length(sequence), -1)
+        
+        // Generate reference sequence (using linear interpolation)
+        original_length = length(sequence)
+        x_orig = linspace(0, 1, original_length)
+        x_new = linspace(0, 1, target_length)
+        R_selected = zeros((target_length, selected_features.shape[1]))
+        
+        for dim in range(selected_features.shape[1]):
+            f = interp_function(x_orig, selected_features[:, dim], type='linear', fill_value="extrapolate")
+            R_selected[:, dim] = f(x_new)
+        
+        // Calculate DTW path
+        _, path = fast_dtw(selected_features, R_selected, distance=euclidean_distance)
+        
+        // Build aligned sequence based on path
+        aligned = zeros((target_length, sequence.shape[1]))
+        counts = zeros(target_length)
+        
+        for s_idx, r_idx in path:
+            aligned[r_idx] += sequence[s_idx]
+            counts[r_idx] += 1
+        
+        // Process unaligned positions and normalize
+        counts[counts == 0] = 1  // Avoid division by zero
+        aligned /= counts[:, new_axis]
+        
+        return aligned
+    
+    normalize(sequence):
+        mean_val = mean(sequence, axis=0)
+        std_val = std(sequence, axis=0)
+        return (sequence - mean_val) / (std_val + 1e-8)
+    
+    process(sequence):
+        processed = align_sequence(sequence)
+        return normalize(processed)
+
+// Metrics Callback Class
+class MetricsCallback(CallbackBase):
+    initialize(X_val, y_val):
+        super().__initialize__()
+        this.X_val = X_val
+        this.y_val = y_val
+    
+    on_epoch_end(epoch, logs=null):
+        // Predict validation set
+        y_pred = this.model.predict(this.X_val, verbose=0)
+        y_pred_classes = argmax(y_pred, axis=1)
+        
+        // Calculate metrics
+        val_recall = recall_score(this.y_val, y_pred_classes, average='macro')
+        val_f1 = f1_score(this.y_val, y_pred_classes, average='macro')
+        
+        // Record to training logs
+        logs['val_recall'] = val_recall
+        logs['val_f1'] = val_f1
+        
+        // Output metrics results
+        print(f" - val_recall: {val_recall:.4f} - val_f1: {val_f1:.4f}")
+
+// Build Model Function
+build_model():
+    inputs = tf.keras.Input(shape=CONFIG["input_shape"])
+    
+    // Spatiotemporal feature parallel extraction
+    // Branch 1: CNN processes local features
+    cnn = tf.keras.layers.Conv1D(64, 5, padding='same')(inputs)
+    cnn = tf.keras.layers.BatchNormalization()(cnn)
+    cnn = tf.keras.layers.ReLU()(cnn)
+    cnn = tf.keras.layers.Dropout(0.3)(cnn)
+    
+    // Branch 2: BiLSTM processes temporal features
+    lstm = tf.keras.layers.Bidirectional(
+        tf.keras.layers.LSTM(32, return_sequences=true))(inputs)
+    lstm = tf.keras.layers.Conv1D(64, 3, padding='same')(lstm)  // Unify channel count
+    
+    // Feature fusion (concatenate along feature axis)
+    merged = tf.keras.layers.concatenate([cnn, lstm], axis=-1)
+    
+    // Joint spatiotemporal feature processing
+    x = tf.keras.layers.Conv1D(128, 3, padding='same')(merged)
+    x = tf.keras.layers.GlobalAveragePooling1D()(x)
+    
+    // Classification layers
+    x = tf.keras.layers.Dense(64, activation='relu',
+                            kernel_regularizer='l2')(x)
+    x = tf.keras.layers.Dropout(0.5)(x)
+    outputs = tf.keras.layers.Dense(len(classes), activation='softmax')(x)
+    
+    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    
+    // Optimizer configuration
+    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+    model.compile(optimizer=optimizer,
+                loss='sparse_categorical_crossentropy',
+                metrics=['accuracy'])
+    return model
+
+// Data Augmenter Class
+class DataAugmenter:
+    initialize():
+        noise_factor = 0.03
+    
+    augment(sequence):
+        // Temporal augmentation
+        if random.random() > 0.5:
+            sequence = temporal_warping(sequence)
+        
+        // Spatial augmentation
+        sequence += random.normal(0, noise_factor, sequence.shape)
+        return sequence
+    
+    temporal_warping(sequence):
+        x = linspace(0, 1, length(sequence))
+        new_x = linspace(0, 1, length(sequence)) + random.normal(0, 0.1, length(sequence))
+        new_x = clip(new_x, 0, 1)
+        return interp_function(x, sequence, axis=0)(new_x)
+
+// Load Dataset Function
+load_dataset():
+    global classes  // Declare as global variable for other functions to use
+    
+    categories = sorted([d for d in listdir(CONFIG["data_dir"])
+                        if os.path.isdir(joinpath(CONFIG["data_dir"], d))])
+    print(categories)
+    label_encoder = LabelEncoder().fit(categories)
+    classes = label_encoder.classes_
+    
+    print(classes)
+    
+    extractor = FeatureExtractor()
+    processor = SequenceProcessor()
+    
+    X, y = [], []
+    for label_name in categories:
+        print(label_name)
+        label_idx = label_encoder.transform([label_name])[0]
+        video_dir = joinpath(CONFIG["data_dir"], label_name)
+        
+        video_files = [f for f in listdir(video_dir)
+                      if f.lower().endswith('.mp4')]
+        
+        for video_file in tqdm(video_files, desc=f'Processing {label_name}'):
+            video_path = joinpath(video_dir, video_file)
+            raw_seq = extractor.process_video(video_path)
+            
+            // Data filtering and processing
+            if length(raw_seq) < 5:  // Filter short sequences
+                continue
+            
+            try:
+                processed = processor.process(raw_seq)
+                if CONFIG["is_training"]:  // Only augment during training
+                    for _ in range(CONFIG["AugTimes"]):
+                        processed = DataAugmenter().augment(processed)
+                        X.append(processed)
+                        y.append(label_idx)
+                else:
+                    X.append(processed)
+                    y.append(label_idx)
+            except Exception as e:
+                print(f"Error processing {video_path}: {str(e)}")
+                continue
+    
+    X = array(X).astype(float32)
+    y = array(y)
+    return X, y
+
+// Training Main Process
+train():
+    // Load data
+    X, y = load_dataset()
+    print(f"Dataset loaded: {X.shape} sequences, {len(classes)} classes")
+    
+    // Split dataset
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42)
+    
+    // Build model
+    model = build_model()
+    model.summary()  // Print model structure
+    
+    // Training configuration
+    callbacks = [
+        MetricsCallback(X_val, y_val),
+        tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=true),
+        tf.keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=3)
+    ]
+    
+    // Start training
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=CONFIG["epochs"],
+        batch_size=CONFIG["batch_size"],
+        callbacks=callbacks
+    )
+    
+    print("Training finished")
+    
+    // Save model
+    model.save(CONFIG["model_path"], save_format='tf')
+    print(f"Model saved to {CONFIG['model_path']}")
+    return model
