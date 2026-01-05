@@ -1,0 +1,184 @@
+Algorithm: SAMM Micro-expression Recognition Real-time Detection Algorithm
+
+// Global configuration parameters
+CONFIG = {
+    data_dir: "E:\\LW\\SAMM_videos",         // Dataset path
+    use_refined_landmarks: true,            // Whether to use refined landmarks (false=468, true=478)
+    target_length: 20,                      // Unified sequence length
+    batch_size: 2,                         // Training batch size
+    epochs: 100,                           // Maximum training epochs
+    model_path: "me_model_tf.h5",          // Model save path
+    min_frames: 10,                        // Minimum frames for real-time detection
+    is_training: false,                    // Whether in training mode
+    AugTimes: 5                            // Data augmentation times, effective in training mode
+}
+
+// Calculate input dimensions
+LANDMARK_POINTS = 478 if CONFIG["use_refined_landmarks"] is true else 468
+CONFIG["input_shape"] = (CONFIG["target_length"], LANDMARK_POINTS * 3)
+
+// Feature Extractor Class (for real-time detection)
+class FeatureExtractor:
+    initialize():
+        face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=false,
+            max_num_faces=1,
+            refine_landmarks=CONFIG["use_refined_landmarks"],
+            min_detection_confidence=0.5)
+    
+    process_single_frame(frame):
+        results = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        if results.multi_face_landmarks exists:
+            landmarks = array([[lm.x, lm.y, lm.z]
+                                for lm in results.multi_face_landmarks[0].landmark])
+            return landmarks.flatten()
+        return null
+
+// Sequence Processor Class (for real-time detection)
+class SequenceProcessor:
+    initialize():
+        target_length = CONFIG["target_length"]
+        selected_indices = [x for x in range(LANDMARK_POINTS)]
+    
+    align_sequence(sequence):
+        if sequence.length() < 2:
+            return zeros((target_length, sequence.shape[1]))
+        
+        // Extract keypoint features for DTW alignment
+        selected_features = sequence[:, selected_indices].reshape(length(sequence), -1)
+        
+        // Generate reference sequence (using linear interpolation)
+        original_length = length(sequence)
+        x_orig = linspace(0, 1, original_length)
+        x_new = linspace(0, 1, target_length)
+        R_selected = zeros((target_length, selected_features.shape[1]))
+        
+        for dim in range(selected_features.shape[1]):
+            f = interp_function(x_orig, selected_features[:, dim], type='linear', fill_value="extrapolate")
+            R_selected[:, dim] = f(x_new)
+        
+        // Calculate DTW path
+        _, path = fast_dtw(selected_features, R_selected, distance=euclidean_distance)
+        
+        // Build aligned sequence based on path
+        aligned = zeros((target_length, sequence.shape[1]))
+        counts = zeros(target_length)
+        
+        for s_idx, r_idx in path:
+            aligned[r_idx] += sequence[s_idx]
+            counts[r_idx] += 1
+        
+        // Process unaligned positions and normalize
+        counts[counts == 0] = 1  // Avoid division by zero
+        aligned /= counts[:, new_axis]
+        
+        return aligned
+    
+    normalize(sequence):
+        mean_val = mean(sequence, axis=0)
+        std_val = std(sequence, axis=0)
+        return (sequence - mean_val) / (std_val + 1e-8)
+    
+    process(sequence):
+        processed = align_sequence(sequence)
+        return normalize(processed)
+
+// Real-time Detector Class
+class RealTimeDetector:
+    initialize():
+        model = tf.keras.models.load_model(CONFIG["model_path"])
+        face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=false,
+            max_num_faces=1,
+            refine_landmarks=CONFIG["use_refined_landmarks"],
+            min_detection_confidence=0.5)
+        processor = SequenceProcessor()
+        buffer = []
+    
+    detect(frame):
+        // Convert color space
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        // Detect facial landmarks
+        results = face_mesh.process(rgb_frame)
+        if not results.multi_face_landmarks exists:
+            return frame, null
+        
+        // Extract features
+        landmarks = array([[lm.x, lm.y, lm.z]
+                            for lm in results.multi_face_landmarks[0].landmark])
+        buffer.append(landmarks.flatten())
+        
+        // Maintain buffer length
+        if length(buffer) > CONFIG["target_length"]:
+            buffer = buffer[-CONFIG["target_length"]:]
+        
+        // Start prediction when minimum frames reached
+        if length(buffer) >= CONFIG["min_frames"]:
+            try:
+                processed = processor.process(array(buffer))
+                pred = model.predict(processed[new_axis, ...], verbose=0)[0]
+                label_idx = argmax(pred)
+                return frame, classes[label_idx]
+            except Exception as e:
+                print(f"Prediction error: {str(e)}")
+                load_label()
+                return frame, null
+        
+        return frame, null
+
+// Real-time Demo Function
+realtime_demo():
+    detector = RealTimeDetector()
+    
+    // Open camera
+    cap = cv2.VideoCapture(0)
+    cv2.namedWindow("Micro-expression Detection", cv2.WINDOW_NORMAL)
+    
+    start_time = time.time()
+    counter = 0
+    
+    while true:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        counter += 1  // Count frames
+        // Process frame and display result
+        processed_frame, pred = detector.detect(frame)
+        if pred exists:
+            cv2.putText(processed_frame, f"Prediction: {pred}", (20, 50),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        if (time.time() - start_time) != 0:  // Display real-time FPS
+            cv2.putText(frame, "FPS {0}".format(float('%.1f' % (counter / (time.time() - start_time)))), (5, 400),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255),
+                    3)
+            // print("FPS: ", counter / (time.time() - start_time))
+            counter = 0
+            start_time = time.time()
+        cv2.imshow("Micro-expression Detection", processed_frame)
+        
+        // Exit key
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+    cap.release()
+    cv2.destroyAllWindows()
+
+// Load Label Function
+load_label():
+    global classes  // Declare as global variable for other functions to use
+    
+    categories = sorted([d for d in listdir(CONFIG["data_dir"])
+                        if os.path.isdir(joinpath(CONFIG["data_dir"], d))])
+    label_encoder = LabelEncoder().fit(categories)
+    classes = label_encoder.classes_
+
+// Main Execution Flow
+main_function():
+    // Load class labels
+    load_label()
+    
+    // Run real-time detection
+    realtime_demo()
