@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This project contains complete algorithm pseudocode for the SAMM (Spontaneous Affective Facial Expressions in the Wild) micro-expression recognition system. The system uses facial landmark detection and deep learning techniques to identify and classify micro-expressions.
+This project contains algorithm pseudocode for the paper "Dual-Branch Network with Dynamic Time Warping". The main paper uses the CASMEⅡ dataset for experiments, while this pseudocode uses the SAMM dataset for demonstration purposes. The system uses facial landmark detection and deep learning techniques to identify and classify micro-expressions.
 
 ## Directory Structure
 
